@@ -22,19 +22,33 @@ data class DualSubtitleCue(
 )
 
 object DualSubtitleAligner {
+    private fun deduplicateCues(cues: List<SubtitleCue>, offset: Long): List<SubtitleCue> {
+        val cleaned = cues
+            .filter { it.text.any { line -> line.isNotBlank() } }
+            .map { SubtitleCue(it.startTimeMs - offset, maxOf(500L, it.durationMs), it.text) }
+            .sortedBy { it.startTimeMs }
+
+        val result = mutableListOf<SubtitleCue>()
+        for (cue in cleaned) {
+            val last = result.lastOrNull()
+            if (last != null && last.text == cue.text && kotlin.math.abs(last.startTimeMs - cue.startTimeMs) <= 2000L) {
+                val newEnd = maxOf(last.endTimeMs, cue.endTimeMs)
+                result[result.lastIndex] = last.copy(durationMs = maxOf(last.durationMs, newEnd - last.startTimeMs))
+            } else {
+                result.add(cue)
+            }
+        }
+        return result
+    }
+
     fun align(
         primaryCues: List<SubtitleCue>,
         primaryOffset: Long,
         secondaryCues: List<SubtitleCue>,
         secondaryOffset: Long
     ): List<DualSubtitleCue> {
-        val pList = primaryCues.map {
-            SubtitleCue(it.startTimeMs - primaryOffset, it.durationMs, it.text)
-        }.sortedBy { it.startTimeMs }
-
-        val sList = secondaryCues.map {
-            SubtitleCue(it.startTimeMs - secondaryOffset, it.durationMs, it.text)
-        }.sortedBy { it.startTimeMs }
+        val pList = deduplicateCues(primaryCues, primaryOffset)
+        val sList = deduplicateCues(secondaryCues, secondaryOffset)
 
         if (pList.isEmpty() && sList.isEmpty()) return emptyList()
         if (pList.isEmpty()) {
@@ -105,9 +119,14 @@ object DualSubtitleAligner {
 class DualSubtitleAdapter(
     private var currentTimeMs: Long,
     val clickCallback: (DualSubtitleCue) -> Unit
-) : NoStateAdapter<DualSubtitleCue>(diffCallback = BaseDiffCallback(itemSame = { a, b ->
-    a.startTimeMs == b.startTimeMs && a.endTimeMs == b.endTimeMs
-})) {
+) : NoStateAdapter<DualSubtitleCue>(diffCallback = BaseDiffCallback(
+    itemSame = { a, b ->
+        a.startTimeMs == b.startTimeMs && a.primaryText == b.primaryText && a.secondaryText == b.secondaryText
+    },
+    contentSame = { a, b ->
+        a.startTimeMs == b.startTimeMs && a.endTimeMs == b.endTimeMs && a.primaryText == b.primaryText && a.secondaryText == b.secondaryText
+    }
+)) {
 
     companion object {
         fun formatTime(timeMs: Long): String {

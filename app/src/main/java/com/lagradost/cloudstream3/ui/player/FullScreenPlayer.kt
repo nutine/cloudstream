@@ -236,6 +236,7 @@ open class FullScreenPlayer : AbstractPlayerFragment<FragmentPlayerBinding>(
     }
 
     override fun onDestroyView() {
+        subtitleHolder?.removeCallbacks(ghostSubtitleHideRunnable)
         playerHostView?.releaseOverlayLayoutListener()
         playerBinding = null
         super.onDestroyView()
@@ -371,6 +372,7 @@ open class FullScreenPlayer : AbstractPlayerFragment<FragmentPlayerBinding>(
         val noSubs = (isBuiltinSubtitles || tracks.currentTextTracks.isEmpty()) && !hasSecondarySub
         playerBinding?.playerSubtitleOffsetBtt?.isGone = noSubs
         val hasAnySubs = tracks.currentTextTracks.isNotEmpty() || hasSecondarySub
+        updateGhostSubtitleVisibility()
     }
 
     private fun restoreOrientationWithSensor(activity: Activity) {
@@ -513,6 +515,41 @@ open class FullScreenPlayer : AbstractPlayerFragment<FragmentPlayerBinding>(
         player.seekTime(85000) // skip 85s
     }
 
+    /**
+     * subtitle/comparison dialogları ayrı window açdığı üçün activity-nin
+     * window brightness-ni miras almır → sistem parlaqlığına qayıdıb dim görünür.
+     * activity dəyərini dialog window-a köçür, DIM_BEHIND-i təmizlə,
+     * extra brightness (>100%) varsa ağ overlay-i dialog üzərində bərpa et.
+     */
+    private fun Dialog.applyPlayerBrightness() {
+        window?.let { dw ->
+            activity?.window?.attributes?.let { ab ->
+                if (ab.screenBrightness >= 0f) {
+                    val dlp = dw.attributes
+                    dlp.screenBrightness = ab.screenBrightness
+                    dw.attributes = dlp
+                }
+            }
+            dw.clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+            val extra = playerHostView?.gestureHelper?.currentExtraBrightness ?: 0f
+            if (extra > 0f) {
+                val overlay = View(dw.context).apply {
+                    setBackgroundColor(Color.WHITE)
+                    alpha = extra.coerceIn(0f, 1f)
+                    isClickable = false
+                    isFocusable = false
+                }
+                (dw.decorView as? ViewGroup)?.addView(
+                    overlay,
+                    ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT
+                    )
+                )
+            }
+        }
+    }
+
     private fun showSubtitleOffsetDialog(isSecondary: Boolean = false) {
         val ctx = context ?: return
         // Pause player because the subtitles cannot be continuously updated to follow playback.
@@ -529,6 +566,7 @@ open class FullScreenPlayer : AbstractPlayerFragment<FragmentPlayerBinding>(
         }
         this.selectSubtitlesDialog = dialog
         dialog.show()
+        dialog.applyPlayerBrightness()
 
         val isPortrait =
             ctx.resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
@@ -683,6 +721,7 @@ open class FullScreenPlayer : AbstractPlayerFragment<FragmentPlayerBinding>(
         }
         this.dualSubtitlesDialog = dialog
         dialog.show()
+        dialog.applyPlayerBrightness()
 
         val isPortrait =
             ctx.resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
@@ -715,16 +754,28 @@ open class FullScreenPlayer : AbstractPlayerFragment<FragmentPlayerBinding>(
                 dualSubtitlesRecyclerview.scrollToPosition(activeIndex)
             }
 
-            if (pCues.isEmpty() && primarySub != null && primarySub.origin != SubtitleOrigin.EMBEDDED_IN_VIDEO) {
-                root.postDelayed({
-                    val delayedPCues = player.getSubtitleCues()
-                    if (delayedPCues.isNotEmpty()) {
-                        val newAligned = DualSubtitleAligner.align(delayedPCues, pOffset, player.getSecondarySubtitleCues(), sOffset)
-                        adapter.submitList(newAligned)
-                        noDualSubtitlesNotice.isVisible = newAligned.isEmpty()
-                        dualSubtitlesRecyclerview.isVisible = newAligned.isNotEmpty()
-                    }
-                }, 500)
+            val needsRetry = (pCues.isEmpty() && primarySub != null) || (sCues.isEmpty() && secondarySub != null)
+            if (needsRetry) {
+                var retries = 0
+                fun retryFetch() {
+                    root.postDelayed({
+                        val newP = player.getSubtitleCues()
+                        val newS = player.getSecondarySubtitleCues()
+                        if (newP.size != pCues.size || newS.size != sCues.size) {
+                            val newAligned = DualSubtitleAligner.align(newP, pOffset, newS, sOffset)
+                            adapter.submitList(newAligned)
+                            noDualSubtitlesNotice.isVisible = newAligned.isEmpty()
+                            dualSubtitlesRecyclerview.isVisible = newAligned.isNotEmpty()
+                            val idx = adapter.getLatestActiveItem(currentPosition)
+                            if (idx in newAligned.indices) {
+                                dualSubtitlesRecyclerview.scrollToPosition(idx)
+                            }
+                        } else if (++retries < 3) {
+                            retryFetch()
+                        }
+                    }, 400)
+                }
+                retryFetch()
             }
 
             dualSubCloseBtt.setOnClickListener {
@@ -974,9 +1025,12 @@ open class FullScreenPlayer : AbstractPlayerFragment<FragmentPlayerBinding>(
             ?: playerBinding?.root?.findViewById<View>(R.id.secondary_subtitle_view)
             ?: binding?.root?.findViewById<View>(R.id.secondary_subtitle_view)
         val isPaused = currentPlayerStatus == CSPlayerLoading.IsPaused
+        val pos = player.getPosition() ?: 0L
+        val isReplaying = replaySubtitleUntilMs > 0L && pos < replaySubtitleUntilMs
         if (player.getCurrentSecondarySubtitle() != null) {
-            secView?.visibility = if (isPaused || DataStoreHelper.alwaysShowSecondarySubtitles) View.VISIBLE else View.GONE
+            secView?.visibility = if (isPaused || isReplaying || DataStoreHelper.alwaysShowSecondarySubtitles) View.VISIBLE else View.GONE
         }
+        updateGhostSubtitleVisibility()
     }
 
     // When the hold-speedup gesture fires, hide controls so the video is unobstructed.
@@ -991,22 +1045,145 @@ open class FullScreenPlayer : AbstractPlayerFragment<FragmentPlayerBinding>(
             ?: binding?.root?.findViewById<View>(R.id.secondary_subtitle_view)
         Log.i("FullScreenPlayer", "onHoldSecondarySubtitle: show=$show, secView=$secView")
         secView?.visibility = if (show || DataStoreHelper.alwaysShowSecondarySubtitles) View.VISIBLE else View.GONE
+        if (show) {
+            subtitleHolder?.alpha = 1f
+        } else {
+            updateGhostSubtitleVisibility()
+        }
     }
 
     override fun onOpenDualSubtitleDialog() {
         showDualSubtitlesDialog()
     }
 
+    private var replaySubtitleUntilMs: Long = -1L
+    private var replaySeekTargetMs: Long = -1L
+
+    private val ghostSubtitleHideRunnable = Runnable {
+        updateGhostSubtitleVisibility()
+    }
+
+    fun updateGhostSubtitleVisibility() {
+        val holder = subtitleHolder ?: return
+        val pos = player.getPosition() ?: 0L
+        val isPaused = currentPlayerStatus == CSPlayerLoading.IsPaused
+        val isReplaying = replaySubtitleUntilMs > 0L && (replaySeekTargetMs > 0L || pos < replaySubtitleUntilMs)
+
+        val secView = holder.findViewById<View>(R.id.secondary_subtitle_view)
+            ?: playerBinding?.root?.findViewById<View>(R.id.secondary_subtitle_view)
+            ?: binding?.root?.findViewById<View>(R.id.secondary_subtitle_view)
+        if (player.getCurrentSecondarySubtitle() != null) {
+            secView?.visibility = if (isPaused || isReplaying || DataStoreHelper.alwaysShowSecondarySubtitles) View.VISIBLE else View.GONE
+        }
+
+        if (!DataStoreHelper.ghostSubtitlesEnabled) {
+            holder.alpha = 1f
+            return
+        }
+        holder.alpha = if (isPaused || isReplaying) 1f else 0f
+
+        holder.removeCallbacks(ghostSubtitleHideRunnable)
+        if (isReplaying && replaySeekTargetMs <= 0L) {
+            val remainingMs = replaySubtitleUntilMs - pos
+            if (remainingMs > 0L) {
+                holder.postDelayed(ghostSubtitleHideRunnable, remainingMs)
+            }
+        }
+    }
+
+    override fun playerPositionChanged(position: Long, duration: Long) {
+        if (replaySeekTargetMs > 0L) {
+            if (position <= replaySubtitleUntilMs || kotlin.math.abs(position - replaySeekTargetMs) < 1500L) {
+                replaySeekTargetMs = -1L
+                updateGhostSubtitleVisibility()
+            }
+            return
+        }
+
+        if (DataStoreHelper.ghostSubtitlesEnabled && replaySubtitleUntilMs > 0L && position >= replaySubtitleUntilMs) {
+            replaySubtitleUntilMs = -1L
+            updateGhostSubtitleVisibility()
+        }
+    }
+
     private val subJumpHideRunnable = Runnable {
         playerBinding?.playerTimeText?.isVisible = false
     }
 
+    private fun smartRewindSubtitle(): Boolean {
+        val pos = player.getPosition() ?: return false
+        val primary = player.getSubtitleCues()
+        val secondary = player.getSecondarySubtitleCues()
+        val hasSec = player.getCurrentSecondarySubtitle() != null && secondary.isNotEmpty()
+        val hasPrim = player.getCurrentPreferredSubtitle() != null && primary.isNotEmpty()
+        val rawCues = when {
+            hasSec -> secondary
+            hasPrim -> primary
+            secondary.isNotEmpty() -> secondary
+            else -> primary
+        }
+        val cues = rawCues
+            .filter { it.text.any { line -> line.isNotBlank() } }
+            .sortedBy { it.startTimeMs }
+            .distinctBy { it.startTimeMs to it.text }
+
+        if (cues.isEmpty()) return false
+
+        val activeOrRecent = cues.lastOrNull { it.startTimeMs <= pos && pos <= it.endTimeMs + 1200L }
+
+        val target = if (activeOrRecent != null) {
+            val progressInCue = pos - activeOrRecent.startTimeMs
+            if (progressInCue > 1500L) {
+                activeOrRecent
+            } else {
+                cues.lastOrNull { it.startTimeMs < activeOrRecent.startTimeMs } ?: activeOrRecent
+            }
+        } else {
+            cues.lastOrNull { it.startTimeMs < pos } ?: cues.firstOrNull()
+        } ?: return false
+
+        replaySeekTargetMs = target.startTimeMs
+        replaySubtitleUntilMs = target.endTimeMs + 600L
+        updateGhostSubtitleVisibility()
+        context?.vibrateDevice(35L)
+        player.seekTo(target.startTimeMs, PlayerEventSource.UI)
+        playerBinding?.playerTimeText?.apply {
+            isVisible = true
+            text = "⏮"
+            removeCallbacks(subJumpHideRunnable)
+            postDelayed(subJumpHideRunnable, 800L)
+        }
+        return true
+    }
+
+    override fun onDoubleTapRewind(): Boolean {
+        return smartRewindSubtitle()
+    }
+
     private fun jumpToSubtitle(next: Boolean) {
+        if (!next) {
+            if (smartRewindSubtitle()) return
+            context?.let { ctx ->
+                com.lagradost.cloudstream3.CommonActivity.showToast(activity, "No subtitles loaded", android.widget.Toast.LENGTH_SHORT)
+            }
+            return
+        }
+
         val pos = player.getPosition() ?: return
         val primary = player.getSubtitleCues()
         val secondary = player.getSecondarySubtitleCues()
-        val cues = (if (primary.size >= secondary.size && primary.isNotEmpty()) primary else secondary)
+        val hasSec = player.getCurrentSecondarySubtitle() != null && secondary.isNotEmpty()
+        val hasPrim = player.getCurrentPreferredSubtitle() != null && primary.isNotEmpty()
+        val rawCues = when {
+            hasSec -> secondary
+            hasPrim -> primary
+            secondary.isNotEmpty() -> secondary
+            else -> primary
+        }
+        val cues = rawCues
+            .filter { it.text.any { line -> line.isNotBlank() } }
             .sortedBy { it.startTimeMs }
+            .distinctBy { it.startTimeMs to it.text }
 
         if (cues.isEmpty()) {
             context?.let { ctx ->
@@ -1015,27 +1192,16 @@ open class FullScreenPlayer : AbstractPlayerFragment<FragmentPlayerBinding>(
             return
         }
 
-        val target = if (next) {
-            cues.firstOrNull { it.startTimeMs > pos + 400L }
-        } else {
-            val currentCue = cues.lastOrNull { it.startTimeMs <= pos && pos <= it.endTimeMs + 500L }
-            if (currentCue != null && pos - currentCue.startTimeMs > 1000L) {
-                currentCue
-            } else {
-                cues.lastOrNull { it.startTimeMs < pos - 1000L } ?: cues.firstOrNull()
-            }
-        }
+        val target = cues.firstOrNull { it.startTimeMs > pos + 400L }
 
         if (target != null) {
             context?.vibrateDevice(35L)
             player.seekTo(target.startTimeMs, PlayerEventSource.UI)
-            val snippet = target.text.firstOrNull()?.replace("\n", " ")?.trim()?.take(45) ?: ""
-            val hudText = "${if (next) "⏭" else "⏮"} $snippet"
             playerBinding?.playerTimeText?.apply {
                 isVisible = true
-                text = hudText
+                text = "⏭"
                 removeCallbacks(subJumpHideRunnable)
-                postDelayed(subJumpHideRunnable, 1200L)
+                postDelayed(subJumpHideRunnable, 800L)
             }
         }
     }

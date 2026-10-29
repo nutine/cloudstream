@@ -283,7 +283,6 @@ class CustomDecoder(private val fallbackFormat: Format?) : SubtitleParser {
 
     val currentSubtitleCues = mutableListOf<SubtitleCue>()
 
-
     override fun parse(
         data: ByteArray,
         offset: Int,
@@ -293,23 +292,37 @@ class CustomDecoder(private val fallbackFormat: Format?) : SubtitleParser {
     ) {
         val currentStyle = style
         val customOutput = Consumer<CuesWithTiming> { cue ->
-            val newCue =
-                CuesWithTiming(cue.cues, cue.startTimeUs, cue.durationUs)
+            val durationMs = if (cue.durationUs == androidx.media3.common.C.TIME_UNSET || cue.durationUs < 0) {
+                3000L
+            } else {
+                cue.durationUs / 1000L
+            }
+            val startMs = cue.startTimeUs / 1000L
+            val textList = cue.cues.mapNotNull { it.text?.toString() }.filter { it.isNotBlank() }
 
-            // Do not apply the offset to the currentSubtitleCues as those are then used for sync subs
-            currentSubtitleCues.add(
-                SubtitleCue(
-                    newCue.startTimeUs / 1000,
-                    newCue.durationUs / 1000,
-                    newCue.cues.map { it.text.toString() })
-            )
+            if (textList.isNotEmpty()) {
+                synchronized(currentSubtitleCues) {
+                    val existingIndex = currentSubtitleCues.indexOfFirst {
+                        it.text == textList && kotlin.math.abs(it.startTimeMs - startMs) <= 1500L
+                    }
+                    if (existingIndex == -1) {
+                        currentSubtitleCues.add(SubtitleCue(startMs, durationMs, textList))
+                        currentSubtitleCues.sortBy { it.startTimeMs }
+                    } else {
+                        val existing = currentSubtitleCues[existingIndex]
+                        if (durationMs > existing.durationMs) {
+                            currentSubtitleCues[existingIndex] = existing.copy(durationMs = durationMs)
+                        }
+                    }
+                }
+            }
 
             // offset timing for the final
             val updatedCues =
                 CuesWithTiming(
-                    newCue.cues,
-                    newCue.startTimeUs - subtitleOffset.times(1000),
-                    newCue.durationUs
+                    cue.cues,
+                    cue.startTimeUs - subtitleOffset.times(1000),
+                    cue.durationUs
                 )
 
             output.accept(updatedCues)
@@ -385,7 +398,10 @@ class CustomSubtitleDecoderFactory : SubtitleDecoderFactory {
     private var latestDecoder: WeakReference<CustomDecoder>? = null
 
     fun getSubtitleCues(): List<SubtitleCue>? {
-        return latestDecoder?.get()?.currentSubtitleCues
+        val decoder = latestDecoder?.get() ?: return null
+        return synchronized(decoder.currentSubtitleCues) {
+            decoder.currentSubtitleCues.toList()
+        }
     }
 
     /**

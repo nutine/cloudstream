@@ -506,6 +506,9 @@
     <string name="subtitles_remove_captions">Remove closed captions from subtitles</string>
     <string name="subtitles_remove_bloat">Remove bloat from subtitles</string>
     <string name="always_show_secondary_subtitles">Always show secondary subtitle</string>
+    <string name="ghost_subtitles_title">Ghost subtitles (show only on replay)</string>
+    <string name="ghost_subtitles_des">Hide subtitles during normal playback; reveal on double-tap rewind</string>
+    <string name="smart_sub_rewind_title">Smart subtitle rewind</string>
     <string name="subtitles_filter_lang">Filter by preferred media language</string>
     <string name="extras">Extras</string>
     <string name="trailer">Trailer</string>

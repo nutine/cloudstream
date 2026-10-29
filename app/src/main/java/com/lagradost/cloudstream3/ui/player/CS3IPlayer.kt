@@ -266,6 +266,10 @@ class CS3IPlayer : IPlayer {
     private var latestEmbeddedSecondaryCues: List<Cue> = emptyList()
     private val embeddedPrimaryCues = mutableListOf<SubtitleCue>()
     private val embeddedSecondaryCues = mutableListOf<SubtitleCue>()
+    private var currentSubtitleDecoder: CustomSubtitleDecoderFactory? = null
+    private var currentTextRenderer: TextRenderer? = null
+    private var currentSecondarySubtitleDecoder: CustomSubtitleDecoderFactory? = null
+    private var currentSecondaryTextRenderer: TextRenderer? = null
 
     /** If we want to play the audio only in the background when the app is not open */
     private var isAudioOnlyBackground = false
@@ -703,8 +707,14 @@ class CS3IPlayer : IPlayer {
         val active = getCurrentPreferredSubtitle()
         if (primaryCues.isNotEmpty()) return primaryCues
         val decoderCues = currentSubtitleDecoder?.getSubtitleCues()
-        if (!decoderCues.isNullOrEmpty()) return decoderCues
-        if (embeddedPrimaryCues.isNotEmpty()) return synchronized(embeddedPrimaryCues) { embeddedPrimaryCues.toList() }
+        val embCues = synchronized(embeddedPrimaryCues) { embeddedPrimaryCues.toList() }
+        val cues = when {
+            !decoderCues.isNullOrEmpty() && decoderCues.size >= embCues.size -> decoderCues
+            embCues.isNotEmpty() -> embCues
+            !decoderCues.isNullOrEmpty() -> decoderCues
+            else -> emptyList()
+        }
+        if (cues.isNotEmpty()) return cues
         if (active != null && active.origin != SubtitleOrigin.EMBEDDED_IN_VIDEO) {
             try {
                 primarySubtitleFuture?.get(1500, TimeUnit.MILLISECONDS)
@@ -845,7 +855,22 @@ class CS3IPlayer : IPlayer {
 
     override fun getSecondarySubtitleCues(): List<SubtitleCue> {
         if (secondaryCues.isNotEmpty()) return secondaryCues
-        if (embeddedSecondaryCues.isNotEmpty()) return synchronized(embeddedSecondaryCues) { embeddedSecondaryCues.toList() }
+        val decoderCues = currentSecondarySubtitleDecoder?.getSubtitleCues()
+        val embCues = synchronized(embeddedSecondaryCues) { embeddedSecondaryCues.toList() }
+        val cues = when {
+            !decoderCues.isNullOrEmpty() && decoderCues.size >= embCues.size -> decoderCues
+            embCues.isNotEmpty() -> embCues
+            !decoderCues.isNullOrEmpty() -> decoderCues
+            else -> emptyList()
+        }
+        if (cues.isNotEmpty()) return cues
+        val activeSec = currentSecondarySubtitle
+        if (activeSec != null && activeSec.origin != SubtitleOrigin.EMBEDDED_IN_VIDEO) {
+            try {
+                secondarySubtitleFuture?.get(1500, TimeUnit.MILLISECONDS)
+                if (secondaryCues.isNotEmpty()) return secondaryCues
+            } catch (_: Throwable) {}
+        }
         return secondaryCues
     }
 
@@ -877,27 +902,6 @@ class CS3IPlayer : IPlayer {
             backgroundRadius = null
         )
         if (currentSecondarySubtitle?.origin == SubtitleOrigin.EMBEDDED_IN_VIDEO) {
-            val matchingCue = synchronized(embeddedSecondaryCues) {
-                embeddedSecondaryCues.lastOrNull {
-                    position in it.startTimeMs..(it.startTimeMs + it.durationMs)
-                } ?: embeddedSecondaryCues.lastOrNull {
-                    kotlin.math.abs(it.startTimeMs - position) < 3000L
-                }
-            }
-            if (matchingCue != null) {
-                view.setCues(matchingCue.text.map { line ->
-                    Cue.Builder()
-                        .setText(line)
-                        .setTextSize(25f, Cue.TEXT_SIZE_TYPE_ABSOLUTE)
-                        .setLine(0f, Cue.LINE_TYPE_FRACTION)
-                        .setLineAnchor(Cue.ANCHOR_TYPE_START)
-                        .fixSubtitleAlignment()
-                        .applyStyle(transparentTopStyle)
-                        .build()
-                })
-            } else if (latestEmbeddedSecondaryCues.isNotEmpty()) {
-                view.setCues(latestEmbeddedSecondaryCues)
-            }
             return
         }
         val active = secondaryCues.filter { it.startTimeMs <= position + currentSecondarySubtitleOffset && position + currentSecondarySubtitleOffset < it.endTimeMs }
@@ -971,6 +975,8 @@ class CS3IPlayer : IPlayer {
         }
         currentTextRenderer = null
         currentSubtitleDecoder = null
+        currentSecondaryTextRenderer = null
+        currentSecondarySubtitleDecoder = null
         pushSecondaryCues()
 
         exoPlayer?.apply {
@@ -1255,9 +1261,6 @@ class CS3IPlayer : IPlayer {
                 .build()
             return trackSelector
         }
-
-        private var currentSubtitleDecoder: CustomSubtitleDecoderFactory? = null
-        private var currentTextRenderer: TextRenderer? = null
     }
 
     private fun getCurrentTimestamp(writePosition: Long? = null): VideoSkipStamp? {
@@ -1300,6 +1303,9 @@ class CS3IPlayer : IPlayer {
 
     override fun seekTo(time: Long, source: PlayerEventSource) {
         if (isMediaSeekable) {
+            latestEmbeddedSecondaryCues = emptyList()
+            subtitleHelper.secondarySubtitleView?.setCues(emptyList())
+            subtitleHelper.subtitleView?.setCues(emptyList())
             updatedTime(time, source)
             exoPlayer?.seekTo(time)
         } else {
@@ -1560,12 +1566,39 @@ class CS3IPlayer : IPlayer {
 
                         val combinedCues = styledBitmapCues + styledTextCues
 
-                        val pos = exoPlayer?.currentPosition ?: 0L
-                        val textLines = textCues.mapNotNull { it.text?.toString() }
+                        val timeMs = cue.presentationTimeUs / 1000L
+                        val textLines = textCues.mapNotNull { it.text?.toString() }.filter { it.isNotBlank() }
                         if (textLines.isNotEmpty()) {
                             synchronized(embeddedPrimaryCues) {
-                                if (embeddedPrimaryCues.none { kotlin.math.abs(it.startTimeMs - pos) < 800L && it.text == textLines }) {
-                                    embeddedPrimaryCues.add(SubtitleCue(pos, 3000L, textLines))
+                                val existingIndex = embeddedPrimaryCues.indexOfFirst {
+                                    it.text == textLines && kotlin.math.abs(it.startTimeMs - timeMs) <= 3500L
+                                }
+                                if (existingIndex != -1) {
+                                    val cur = embeddedPrimaryCues[existingIndex]
+                                    if (timeMs > cur.startTimeMs) {
+                                        val newDur = maxOf(cur.durationMs, timeMs - cur.startTimeMs + 800L)
+                                        embeddedPrimaryCues[existingIndex] = cur.copy(durationMs = minOf(15000L, newDur))
+                                    }
+                                } else {
+                                    val last = embeddedPrimaryCues.lastOrNull()
+                                    if (last != null && timeMs > last.startTimeMs && timeMs - last.startTimeMs < 10000L) {
+                                        val idx = embeddedPrimaryCues.lastIndex
+                                        val realDur = minOf(10000L, timeMs - last.startTimeMs)
+                                        embeddedPrimaryCues[idx] = last.copy(durationMs = maxOf(800L, realDur))
+                                    }
+                                    embeddedPrimaryCues.add(SubtitleCue(timeMs, 3000L, textLines))
+                                    embeddedPrimaryCues.sortBy { it.startTimeMs }
+                                }
+                            }
+                        } else {
+                            synchronized(embeddedPrimaryCues) {
+                                val lastActiveIndex = embeddedPrimaryCues.indexOfLast {
+                                    it.startTimeMs <= timeMs && timeMs <= it.startTimeMs + 12000L
+                                }
+                                if (lastActiveIndex != -1) {
+                                    val cur = embeddedPrimaryCues[lastActiveIndex]
+                                    val realDur = maxOf(800L, timeMs - cur.startTimeMs)
+                                    embeddedPrimaryCues[lastActiveIndex] = cur.copy(durationMs = minOf(12000L, realDur))
                                 }
                             }
                         }
@@ -1608,16 +1641,44 @@ class CS3IPlayer : IPlayer {
                                 .build()
                         }
                         latestEmbeddedSecondaryCues = styledCues
-                        val pos = exoPlayer?.currentPosition ?: 0L
-                        val textLines = cueGroup.cues.mapNotNull { it.text?.toString() }
+                        subtitleHelper.secondarySubtitleView?.setCues(styledCues)
+
+                        val timeMs = cueGroup.presentationTimeUs / 1000L
+                        val textLines = cueGroup.cues.mapNotNull { it.text?.toString() }.filter { it.isNotBlank() }
                         if (textLines.isNotEmpty()) {
                             synchronized(embeddedSecondaryCues) {
-                                if (embeddedSecondaryCues.none { kotlin.math.abs(it.startTimeMs - pos) < 800L && it.text == textLines }) {
-                                    embeddedSecondaryCues.add(SubtitleCue(pos, 3000L, textLines))
+                                val existingIndex = embeddedSecondaryCues.indexOfFirst {
+                                    it.text == textLines && kotlin.math.abs(it.startTimeMs - timeMs) <= 3500L
+                                }
+                                if (existingIndex != -1) {
+                                    val cur = embeddedSecondaryCues[existingIndex]
+                                    if (timeMs > cur.startTimeMs) {
+                                        val newDur = maxOf(cur.durationMs, timeMs - cur.startTimeMs + 800L)
+                                        embeddedSecondaryCues[existingIndex] = cur.copy(durationMs = minOf(15000L, newDur))
+                                    }
+                                } else {
+                                    val last = embeddedSecondaryCues.lastOrNull()
+                                    if (last != null && timeMs > last.startTimeMs && timeMs - last.startTimeMs < 10000L) {
+                                        val idx = embeddedSecondaryCues.lastIndex
+                                        val realDur = minOf(10000L, timeMs - last.startTimeMs)
+                                        embeddedSecondaryCues[idx] = last.copy(durationMs = maxOf(800L, realDur))
+                                    }
+                                    embeddedSecondaryCues.add(SubtitleCue(timeMs, 3000L, textLines))
+                                    embeddedSecondaryCues.sortBy { it.startTimeMs }
+                                }
+                            }
+                        } else {
+                            synchronized(embeddedSecondaryCues) {
+                                val lastActiveIndex = embeddedSecondaryCues.indexOfLast {
+                                    it.startTimeMs <= timeMs && timeMs <= it.startTimeMs + 12000L
+                                }
+                                if (lastActiveIndex != -1) {
+                                    val cur = embeddedSecondaryCues[lastActiveIndex]
+                                    val realDur = maxOf(800L, timeMs - cur.startTimeMs)
+                                    embeddedSecondaryCues[lastActiveIndex] = cur.copy(durationMs = minOf(12000L, realDur))
                                 }
                             }
                         }
-                        pushSecondaryCues()
                     }
 
                     val renderersList = mutableListOf<androidx.media3.exoplayer.Renderer>()
@@ -1653,6 +1714,9 @@ class CS3IPlayer : IPlayer {
                             ).apply {
                                 @Suppress("DEPRECATION")
                                 experimentalSetLegacyDecodingEnabled(true)
+                            }.also { renderer ->
+                                currentSecondaryTextRenderer = renderer
+                                currentSecondarySubtitleDecoder = secondaryDecoder
                             }
 
                             pIdx = renderersList.size

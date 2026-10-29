@@ -188,6 +188,16 @@
                 app:drawableEndCompat="@null" />
 
             <com.google.android.material.switchmaterial.SwitchMaterial
+                android:id="@+id/ghost_subtitles_toggle"
+                style="@style/SettingsItem"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent"
+                android:fontFamily="@font/google_sans"
+                android:text="@string/ghost_subtitles_title"
+                app:trackTint="@color/toggle_selector"
+                app:drawableEndCompat="@null" />
+
+            <com.google.android.material.switchmaterial.SwitchMaterial
                 android:id="@+id/subtitles_remove_bloat"
                 style="@style/SettingsItem"
                 android:layout_width="match_parent"

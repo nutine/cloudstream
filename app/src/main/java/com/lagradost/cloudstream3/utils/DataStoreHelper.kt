@@ -147,6 +147,8 @@ object DataStoreHelper {
     var playBackSpeed: Float by UserPreferenceDelegate("playback_speed", 1.0f)
     var resizeMode: Int by UserPreferenceDelegate("resize_mode", 0)
     var alwaysShowSecondarySubtitles: Boolean by UserPreferenceDelegate("always_show_secondary_subtitles", false)
+    var ghostSubtitlesEnabled: Boolean by UserPreferenceDelegate("ghost_subtitles_enabled", true)
+    var smartSubRewindEnabled: Boolean by UserPreferenceDelegate("smart_sub_rewind_enabled", true)
     var librarySortingMode: Int by UserPreferenceDelegate(
         "library_sorting_mode",
         ListSorting.AlphabeticalA.ordinal

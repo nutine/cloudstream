@@ -75,10 +75,10 @@ class PlayerGestureHelper(private val playerView: PlayerView) {
 
         /** Double-tap constants */
         /** Maximum finger-hold time (ms) for a tap to qualify as a double-tap seek. */
-        const val DOUBLE_TAP_MAXIMUM_HOLD_TIME = 200L
+        const val DOUBLE_TAP_MAXIMUM_HOLD_TIME = 350L
         /** Time window (ms) between taps to count as a double-tap.
          *  Also determines how long a single-tap is delayed before firing. */
-        const val DOUBLE_TAP_MINIMUM_TIME_BETWEEN = 200L
+        const val DOUBLE_TAP_MINIMUM_TIME_BETWEEN = 350L
         /** Fraction of view width on each side that counts as "left" / "right" seek zone. */
         const val DOUBLE_TAP_PAUSE_PERCENTAGE = 0.15
 
@@ -963,6 +963,41 @@ class PlayerGestureHelper(private val playerView: PlayerView) {
     /** Plays the rewind animation and seeks back by [fastForwardTime]. */
     fun rewind() {
         try {
+            if (DataStoreHelper.smartSubRewindEnabled && playerView.callbacks?.onDoubleTapRewind() == true) {
+                val rewHolder = playerView.playerRewHolder
+                val rew = playerView.playerRew
+                val rewText = playerView.exoRewText
+                val wasShowing = playerView.callbacks?.isUIShowing() ?: false
+                if (rewHolder != null && rew != null) {
+                    val prevCenterMenuGone = playerView.playerCenterMenu?.isGone ?: false
+                    val prevVideoHolderVisible = playerView.playerVideoHolder?.isVisible ?: true
+                    if (!wasShowing) {
+                        playerView.playerCenterMenu?.isGone = false
+                        playerView.playerVideoHolder?.isVisible = true
+                    }
+                    rewHolder.alpha = 1f
+                    rew.startAnimation(AnimationUtils.loadAnimation(context, R.anim.rotate_left))
+                    val goLeft = AnimationUtils.loadAnimation(context, R.anim.go_left)
+                    goLeft.setAnimationListener(object : Animation.AnimationListener {
+                        override fun onAnimationStart(animation: Animation?) {}
+                        override fun onAnimationRepeat(animation: Animation?) {}
+                        override fun onAnimationEnd(animation: Animation?) {
+                            rewText?.post {
+                                resetRewindText()
+                                if (!wasShowing && !(playerView.callbacks?.isUIShowing() ?: false)) {
+                                    playerView.playerCenterMenu?.isGone = prevCenterMenuGone
+                                    playerView.playerVideoHolder?.isVisible = prevVideoHolderVisible
+                                    rewHolder.alpha = 0f
+                                }
+                            }
+                        }
+                    })
+                    rewText?.startAnimation(goLeft)
+                    rewText?.text = "⏮"
+                }
+                return
+            }
+
             val rewHolder = playerView.playerRewHolder ?: return
             val rew = playerView.playerRew
             val rewText = playerView.exoRewText
@@ -1054,22 +1089,24 @@ class PlayerGestureHelper(private val playerView: PlayerView) {
      * @param onSingleTap Invoked when it is determined to be a single tap; may be deferred.
      * @return true if a double-tap action was performed.
      */
-    fun onTapDetected(x: Float, viewWidth: Int, isLocked: Boolean, onSingleTap: () -> Unit): Boolean {
-        val anyDoubleTap = doubleTapEnabled || doubleTapPauseEnabled
+    fun onTapDetected(x: Float, viewWidth: Int, isLocked: Boolean, downTime: Long? = null, onSingleTap: () -> Unit): Boolean {
+        val smartSubRewind = DataStoreHelper.smartSubRewindEnabled
+        val anyDoubleTap = doubleTapEnabled || doubleTapPauseEnabled || smartSubRewind
         if (!anyDoubleTap) {
             onSingleTap()
             return false
         }
 
-        val timeSinceLast = System.currentTimeMillis() - lastTouchEndTime
-        return if (!isLocked && timeSinceLast < DOUBLE_TAP_MINIMUM_TIME_BETWEEN) {
+        val tapTime = downTime ?: System.currentTimeMillis()
+        val timeSinceLast = tapTime - lastTouchEndTime
+        return if (!isLocked && timeSinceLast in 0L until DOUBLE_TAP_MINIMUM_TIME_BETWEEN) {
             /** Double-tap */
             tapCount++
             doubleTapToken++ // cancel any pending single-tap runnable
             if (doubleTapPauseEnabled) {
                 when {
                     x < viewWidth / 2f - (DOUBLE_TAP_PAUSE_PERCENTAGE * viewWidth) -> {
-                        if (doubleTapEnabled) rewind()
+                        if (doubleTapEnabled || smartSubRewind) rewind()
                     }
                     x > viewWidth / 2f + (DOUBLE_TAP_PAUSE_PERCENTAGE * viewWidth) -> {
                         if (doubleTapEnabled) fastForward()
@@ -1078,7 +1115,7 @@ class PlayerGestureHelper(private val playerView: PlayerView) {
                         playerView.player.handleEvent(CSPlayerEvent.PlayPauseToggle, PlayerEventSource.UI)
                     }
                 }
-            } else if (doubleTapEnabled) {
+            } else if (doubleTapEnabled || smartSubRewind) {
                 if (x < viewWidth / 2f) rewind() else fastForward()
             }
             true
@@ -1236,11 +1273,9 @@ class PlayerGestureHelper(private val playerView: PlayerView) {
                     val isTopRightCorner = event.x >= view.width * 0.75f && event.y <= view.height * 0.25f && !isTop
                     val isRight30Percent = event.x >= view.width * 0.7f && !isTopRightCorner && !isNav
                     Log.i(TAG, "ACTION_DOWN: isTopRightCorner=$isTopRightCorner, isRight30Percent=$isRight30Percent, isTop=$isTop, isNav=$isNav (x=${event.x}, y=${event.y}, w=${view.width}, h=${view.height}), secSub=${playerView.player.getCurrentSecondarySubtitle()}")
-                    if (isTopRightCorner && !isLocked) {
-                        holdHandler.postDelayed(dualSubRunnable, 400)
-                    } else if (isRight30Percent && !isLocked && playerView.player.getCurrentSecondarySubtitle() != null) {
+                    if (isRight30Percent && !isLocked && playerView.player.getCurrentSecondarySubtitle() != null) {
                         holdHandler.postDelayed(subRevealRunnable, 200)
-                    } else if (speedupEnabled && playerView.player.getIsPlaying() && !isLocked && !isTop && !isNav) {
+                    } else if (speedupEnabled && playerView.player.getIsPlaying() && !isLocked && !isTop && !isNav && !isTopRightCorner) {
                         holdHandler.postDelayed(holdRunnable, 500)
                     }
                     isVolumeLocked = currentRequestedVolume < 1.0f
@@ -1379,12 +1414,19 @@ class PlayerGestureHelper(private val playerView: PlayerView) {
                         && !hasTriggeredSpeedUp
                         && !hasMoved
                         && (holdTime == null || holdTime < DOUBLE_TAP_MAXIMUM_HOLD_TIME)) {
-                        onTapDetected(
-                            x = currentTouch.x,
-                            viewWidth = view.width,
-                            isLocked = isLocked,
-                            onSingleTap = { playerView.callbacks?.onSingleTap() }
-                        )
+                        val isTopRightCorner = currentTouch.x >= view.width * 0.75f && currentTouch.y <= view.height * 0.25f && !isTouchFromTopEdge
+                        if (isTopRightCorner && !isLocked) {
+                            context.vibrateDevice(50L)
+                            playerView.callbacks?.onOpenDualSubtitleDialog()
+                        } else {
+                            onTapDetected(
+                                x = currentTouch.x,
+                                viewWidth = view.width,
+                                isLocked = isLocked,
+                                downTime = currentTouchStartTime,
+                                onSingleTap = { playerView.callbacks?.onSingleTap() }
+                            )
+                        }
                     }
                 }
 

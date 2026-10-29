@@ -596,6 +596,11 @@ class SubtitlesFragment : BaseDialogFragment<SubtitleSettingsBinding>(
                 DataStoreHelper.alwaysShowSecondarySubtitles = b
             }
 
+            ghostSubtitlesToggle.isChecked = DataStoreHelper.ghostSubtitlesEnabled
+            ghostSubtitlesToggle.setOnCheckedChangeListener { _, b ->
+                DataStoreHelper.ghostSubtitlesEnabled = b
+            }
+
             subtitlesRemoveBloat.isChecked = state.removeBloat
             subtitlesRemoveBloat.setOnCheckedChangeListener { _, b ->
                 state.removeBloat = b
